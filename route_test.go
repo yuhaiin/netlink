@@ -759,7 +759,7 @@ func TestRouteFilterAllTables(t *testing.T) {
 			Priority:  13,
 			Table:     table,
 			Type:      unix.RTN_UNICAST,
-			Tos:       14,
+			Tos:       12,
 			Hoplimit:  100,
 			Realm:     328,
 		}
@@ -773,7 +773,7 @@ func TestRouteFilterAllTables(t *testing.T) {
 		Scope:    unix.RT_SCOPE_LINK,
 		Table:    unix.RT_TABLE_UNSPEC,
 		Type:     unix.RTN_UNICAST,
-		Tos:      14,
+		Tos:      12,
 		Hoplimit: 100,
 		Realm:    328,
 	}, RT_FILTER_DST|RT_FILTER_SRC|RT_FILTER_SCOPE|RT_FILTER_TABLE|RT_FILTER_TYPE|RT_FILTER_TOS|RT_FILTER_HOPLIMIT|RT_FILTER_REALM)
@@ -797,7 +797,7 @@ func TestRouteFilterAllTables(t *testing.T) {
 		if route.Type != unix.RTN_UNICAST {
 			t.Fatal("Invalid Type. Route not added properly")
 		}
-		if route.Tos != 14 {
+		if route.Tos != 12 {
 			t.Fatal("Invalid Tos. Route not added properly")
 		}
 		if route.Hoplimit != 100 {
@@ -847,7 +847,7 @@ func TestRouteExtraFields(t *testing.T) {
 		Priority:  13,
 		Table:     unix.RT_TABLE_MAIN,
 		Type:      unix.RTN_UNICAST,
-		Tos:       14,
+		Tos:       12,
 		Hoplimit:  100,
 		Realm:     239,
 	}
@@ -860,7 +860,7 @@ func TestRouteExtraFields(t *testing.T) {
 		Scope:    unix.RT_SCOPE_LINK,
 		Table:    unix.RT_TABLE_MAIN,
 		Type:     unix.RTN_UNICAST,
-		Tos:      14,
+		Tos:      12,
 		Hoplimit: 100,
 		Realm:    239,
 	}, RT_FILTER_DST|RT_FILTER_SRC|RT_FILTER_SCOPE|RT_FILTER_TABLE|RT_FILTER_TYPE|RT_FILTER_TOS|RT_FILTER_HOPLIMIT|RT_FILTER_REALM)
@@ -883,7 +883,7 @@ func TestRouteExtraFields(t *testing.T) {
 	if routes[0].Type != unix.RTN_UNICAST {
 		t.Fatal("Invalid Type. Route not added properly")
 	}
-	if routes[0].Tos != 14 {
+	if routes[0].Tos != 12 {
 		t.Fatal("Invalid Tos. Route not added properly")
 	}
 	if routes[0].Hoplimit != 100 {
@@ -1152,6 +1152,66 @@ func TestMPLSRouteAddDel(t *testing.T) {
 
 }
 
+func TestIP6tnlRouteAddDel(t *testing.T) {
+	_, err := RouteList(nil, FAMILY_V4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	// get loopback interface
+	link, err := LinkByName("lo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// bring the interface up
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+
+	_, dst, err := net.ParseCIDR("192.168.99.0/24")
+	if err != nil {
+		t.Fatalf("cannot parse destination prefix: %v", err)
+	}
+
+	encap := IP6tnlEncap{
+		Dst: net.ParseIP("2001:db8::"),
+		Src: net.ParseIP("::"),
+	}
+
+	route := &Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       dst,
+		Encap:     &encap,
+	}
+
+	if err := RouteAdd(route); err != nil {
+		t.Fatalf("Cannot add route: %v", err)
+	}
+	routes, err := RouteList(link, FAMILY_V4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatal("Route not added properly")
+	}
+
+	if err := RouteDel(route); err != nil {
+		t.Fatal(err)
+	}
+	routes, err = RouteList(link, FAMILY_V4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 0 {
+		t.Fatal("Route not removed properly")
+	}
+
+}
+
 func TestRouteEqual(t *testing.T) {
 	mplsDst := 100
 	seg6encap := &SEG6Encap{Mode: nl.SEG6_IPTUN_MODE_ENCAP}
@@ -1248,7 +1308,7 @@ func TestRouteEqual(t *testing.T) {
 			Priority: 13,
 			Table:    unix.RT_TABLE_MAIN,
 			Type:     unix.RTN_UNICAST,
-			Tos:      14,
+			Tos:      12,
 		},
 		{
 			LinkIndex: 3,

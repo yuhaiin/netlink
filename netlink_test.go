@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package netlink
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/vishvananda/netlink/nl"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
@@ -22,8 +24,32 @@ import (
 type tearDownNetlinkTest func()
 
 func skipUnlessRoot(t *testing.T) {
+	t.Helper()
+
 	if os.Getuid() != 0 {
 		t.Skip("Test requires root privileges.")
+	}
+}
+
+func skipUnlessKModuleLoaded(t *testing.T, module ...string) {
+	t.Helper()
+	file, err := ioutil.ReadFile("/proc/modules")
+	if err != nil {
+		t.Fatal("Failed to open /proc/modules", err)
+	}
+	for _, mod := range module {
+		found := false
+		for _, line := range strings.Split(string(file), "\n") {
+			n := strings.Split(line, " ")[0]
+			if n == mod {
+				found = true
+				break
+			}
+
+		}
+		if !found {
+			t.Skipf("Test requires kmodule %q.", mod)
+		}
 	}
 }
 
@@ -155,22 +181,7 @@ func setUpSEG6NetlinkTest(t *testing.T) tearDownNetlinkTest {
 }
 
 func setUpNetlinkTestWithKModule(t *testing.T, name string) tearDownNetlinkTest {
-	file, err := ioutil.ReadFile("/proc/modules")
-	if err != nil {
-		t.Fatal("Failed to open /proc/modules", err)
-	}
-	found := false
-	for _, line := range strings.Split(string(file), "\n") {
-		n := strings.Split(line, " ")[0]
-		if n == name {
-			found = true
-			break
-		}
-
-	}
-	if !found {
-		t.Skipf("Test requires kmodule %q.", name)
-	}
+	skipUnlessKModuleLoaded(t, name)
 	return setUpNetlinkTest(t)
 }
 
@@ -185,6 +196,8 @@ func remountSysfs() error {
 }
 
 func minKernelRequired(t *testing.T, kernel, major int) {
+	t.Helper()
+
 	k, m, err := KernelVersion()
 	if err != nil {
 		t.Fatal(err)
@@ -213,4 +226,9 @@ func KernelVersion() (kernel, major int, err error) {
 		err = fmt.Errorf("can't parse kernel version in %q", string(ba))
 	}
 	return
+}
+
+func TestMain(m *testing.M) {
+	nl.EnableErrorMessageReporting = true
+	os.Exit(m.Run())
 }

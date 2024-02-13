@@ -7,6 +7,7 @@ import (
 	"net"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
@@ -1054,14 +1055,12 @@ func setupLinkForTestWithQdisc(t *testing.T, linkName string) (Qdisc, Link) {
 	if err := LinkSetUp(link); err != nil {
 		t.Fatal(err)
 	}
-	attrs := QdiscAttrs{
-		LinkIndex: link.Attrs().Index,
-		Handle:    MakeHandle(0xffff, 0),
-		Parent:    HANDLE_CLSACT,
-	}
-	qdisc := &GenericQdisc{
-		QdiscAttrs: attrs,
-		QdiscType:  "clsact",
+	qdisc := &Clsact{
+		QdiscAttrs: QdiscAttrs{
+			LinkIndex: link.Attrs().Index,
+			Handle:    MakeHandle(0xffff, 0),
+			Parent:    HANDLE_CLSACT,
+		},
 	}
 
 	if err := QdiscAdd(qdisc); err != nil {
@@ -1074,7 +1073,7 @@ func setupLinkForTestWithQdisc(t *testing.T, linkName string) (Qdisc, Link) {
 	if len(qdiscs) != 1 {
 		t.Fatal("Failed to add qdisc", len(qdiscs))
 	}
-	if q, ok := qdiscs[0].(*GenericQdisc); !ok || q.Type() != "clsact" {
+	if q, ok := qdiscs[0].(*Clsact); !ok || q.Type() != "clsact" {
 		t.Fatal("qdisc is the wrong type")
 	}
 	return qdiscs[0], link
@@ -1815,6 +1814,7 @@ func TestFilterFlowerAddDel(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	time.Sleep(time.Second)
 	filters, err := FilterList(link, MakeHandle(0xffff, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -1881,6 +1881,14 @@ func TestFilterFlowerAddDel(t *testing.T) {
 		t.Fatal("Mirred action isn't TC_ACT_STOLEN")
 	}
 
+	if mia.Timestamp == nil || mia.Timestamp.Installed == 0 {
+		t.Fatal("Incorrect mirred action timestamp")
+	}
+
+	if mia.Statistics == nil {
+		t.Fatal("Incorrect mirred action stats")
+	}
+
 	ga, ok := flower.Actions[1].(*GenericAction)
 	if !ok {
 		t.Fatal("Unable to find generic action")
@@ -1888,6 +1896,174 @@ func TestFilterFlowerAddDel(t *testing.T) {
 
 	if ga.Attrs().Action != getTcActGotoChain() {
 		t.Fatal("Generic action isn't TC_ACT_GOTO_CHAIN")
+	}
+
+	if ga.Timestamp == nil || ga.Timestamp.Installed == 0 {
+		t.Fatal("Incorrect generic action timestamp")
+	}
+
+	if ga.Statistics == nil {
+		t.Fatal("Incorrect generic action stats")
+	}
+
+	if err := FilterDel(filter); err != nil {
+		t.Fatal(err)
+	}
+	filters, err = FilterList(link, MakeHandle(0xffff, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filters) != 0 {
+		t.Fatal("Failed to remove filter")
+	}
+
+	if err := QdiscDel(qdisc); err != nil {
+		t.Fatal(err)
+	}
+	qdiscs, err = SafeQdiscList(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found = false
+	for _, v := range qdiscs {
+		if _, ok := v.(*Ingress); ok {
+			found = true
+			break
+		}
+	}
+	if found {
+		t.Fatal("Failed to remove qdisc")
+	}
+}
+
+func TestFilterIPv6FlowerPedit(t *testing.T) {
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+	if err := LinkAdd(&Ifb{LinkAttrs{Name: "foo"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkAdd(&Ifb{LinkAttrs{Name: "bar"}}); err != nil {
+		t.Fatal(err)
+	}
+	link, err := LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+	redir, err := LinkByName("bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(redir); err != nil {
+		t.Fatal(err)
+	}
+
+	qdisc := &Ingress{
+		QdiscAttrs: QdiscAttrs{
+			LinkIndex: link.Attrs().Index,
+			Handle:    MakeHandle(0xffff, 0),
+			Parent:    HANDLE_INGRESS,
+		},
+	}
+	if err := QdiscAdd(qdisc); err != nil {
+		t.Fatal(err)
+	}
+	qdiscs, err := SafeQdiscList(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, v := range qdiscs {
+		if _, ok := v.(*Ingress); ok {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("Qdisc is the wrong type")
+	}
+
+	testMask := net.CIDRMask(64, 128)
+
+	ipproto := new(nl.IPProto)
+	*ipproto = nl.IPPROTO_TCP
+
+	filter := &Flower{
+		FilterAttrs: FilterAttrs{
+			LinkIndex: link.Attrs().Index,
+			Parent:    MakeHandle(0xffff, 0),
+			Priority:  1,
+			Protocol:  unix.ETH_P_ALL,
+		},
+		DestIP:     net.ParseIP("ffff::fff1"),
+		DestIPMask: testMask,
+		EthType:    unix.ETH_P_IPV6,
+		IPProto:    ipproto,
+		DestPort:   6666,
+		Actions:    []Action{},
+	}
+
+	peditAction := NewPeditAction()
+	peditAction.Proto = uint8(nl.IPPROTO_TCP)
+	peditAction.SrcPort = 7777
+	peditAction.SrcIP = net.ParseIP("ffff::fff2")
+	filter.Actions = append(filter.Actions, peditAction)
+
+	miaAction := &MirredAction{
+		ActionAttrs: ActionAttrs{
+			Action: TC_ACT_REDIRECT,
+		},
+		MirredAction: TCA_EGRESS_REDIR,
+		Ifindex:      redir.Attrs().Index,
+	}
+	filter.Actions = append(filter.Actions, miaAction)
+
+	if err := FilterAdd(filter); err != nil {
+		t.Fatal(err)
+	}
+
+	filters, err := FilterList(link, MakeHandle(0xffff, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filters) != 1 {
+		t.Fatal("Failed to add filter")
+	}
+	flower, ok := filters[0].(*Flower)
+	if !ok {
+		t.Fatal("Filter is the wrong type")
+	}
+
+	if filter.EthType != flower.EthType {
+		t.Fatalf("Flower EthType doesn't match")
+	}
+	if !filter.DestIP.Equal(flower.DestIP) {
+		t.Fatalf("Flower DestIP doesn't match")
+	}
+
+	if !reflect.DeepEqual(filter.DestIPMask, testMask) {
+		t.Fatalf("Flower DestIPMask doesn't match")
+	}
+
+	if flower.IPProto == nil || *filter.IPProto != *flower.IPProto {
+		t.Fatalf("Flower IPProto doesn't match")
+	}
+	if filter.DestPort != flower.DestPort {
+		t.Fatalf("Flower DestPort doesn't match")
+	}
+
+	_, ok = flower.Actions[0].(*PeditAction)
+	if !ok {
+		t.Fatal("Unable to find pedit action")
+	}
+
+	_, ok = flower.Actions[1].(*MirredAction)
+	if !ok {
+		t.Fatal("Unable to find mirred action")
 	}
 
 	if err := FilterDel(filter); err != nil {

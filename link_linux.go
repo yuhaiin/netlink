@@ -1634,6 +1634,10 @@ func (h *Handle) linkModify(link Link, flags int) error {
 		if link.VlanProtocol != VLAN_PROTOCOL_UNKNOWN {
 			data.AddRtAttr(nl.IFLA_VLAN_PROTOCOL, htons(uint16(link.VlanProtocol)))
 		}
+	case *Netkit:
+		if err := addNetkitAttrs(link, linkInfo, flags); err != nil {
+			return err
+		}
 	case *Veth:
 		data := linkInfo.AddRtAttr(nl.IFLA_INFO_DATA, nil)
 		peer := data.AddRtAttr(nl.VETH_INFO_PEER, nil)
@@ -1947,6 +1951,8 @@ func LinkDeserialize(hdr *unix.NlMsghdr, m []byte) (Link, error) {
 						link = &Bridge{}
 					case "vlan":
 						link = &Vlan{}
+					case "netkit":
+						link = &Netkit{}
 					case "veth":
 						link = &Veth{}
 					case "wireguard":
@@ -2004,6 +2010,8 @@ func LinkDeserialize(hdr *unix.NlMsghdr, m []byte) (Link, error) {
 						return nil, err
 					}
 					switch linkType {
+					case "netkit":
+						parseNetkitData(link, data)
 					case "vlan":
 						parseVlanData(link, data)
 					case "vxlan":
@@ -2276,21 +2284,24 @@ type LinkUpdate struct {
 // LinkSubscribe takes a chan down which notifications will be sent
 // when links change.  Close the 'done' chan to stop subscription.
 func LinkSubscribe(ch chan<- LinkUpdate, done <-chan struct{}) error {
-	return linkSubscribeAt(netns.None(), netns.None(), ch, done, nil, false)
+	return linkSubscribeAt(netns.None(), netns.None(), ch, done, nil, false, 0, nil, false)
 }
 
 // LinkSubscribeAt works like LinkSubscribe plus it allows the caller
 // to choose the network namespace in which to subscribe (ns).
 func LinkSubscribeAt(ns netns.NsHandle, ch chan<- LinkUpdate, done <-chan struct{}) error {
-	return linkSubscribeAt(ns, netns.None(), ch, done, nil, false)
+	return linkSubscribeAt(ns, netns.None(), ch, done, nil, false, 0, nil, false)
 }
 
 // LinkSubscribeOptions contains a set of options to use with
 // LinkSubscribeWithOptions.
 type LinkSubscribeOptions struct {
-	Namespace     *netns.NsHandle
-	ErrorCallback func(error)
-	ListExisting  bool
+	Namespace              *netns.NsHandle
+	ErrorCallback          func(error)
+	ListExisting           bool
+	ReceiveBufferSize      int
+	ReceiveBufferForceSize bool
+	ReceiveTimeout         *unix.Timeval
 }
 
 // LinkSubscribeWithOptions work like LinkSubscribe but enable to
@@ -2301,13 +2312,26 @@ func LinkSubscribeWithOptions(ch chan<- LinkUpdate, done <-chan struct{}, option
 		none := netns.None()
 		options.Namespace = &none
 	}
-	return linkSubscribeAt(*options.Namespace, netns.None(), ch, done, options.ErrorCallback, options.ListExisting)
+	return linkSubscribeAt(*options.Namespace, netns.None(), ch, done, options.ErrorCallback, options.ListExisting,
+		options.ReceiveBufferSize, options.ReceiveTimeout, options.ReceiveBufferForceSize)
 }
 
-func linkSubscribeAt(newNs, curNs netns.NsHandle, ch chan<- LinkUpdate, done <-chan struct{}, cberr func(error), listExisting bool) error {
+func linkSubscribeAt(newNs, curNs netns.NsHandle, ch chan<- LinkUpdate, done <-chan struct{}, cberr func(error), listExisting bool,
+	rcvbuf int, rcvTimeout *unix.Timeval, rcvbufForce bool) error {
 	s, err := nl.SubscribeAt(newNs, curNs, unix.NETLINK_ROUTE, unix.RTNLGRP_LINK)
 	if err != nil {
 		return err
+	}
+	if rcvTimeout != nil {
+		if err := s.SetReceiveTimeout(rcvTimeout); err != nil {
+			return err
+		}
+	}
+	if rcvbuf != 0 {
+		err = s.SetReceiveBufferSize(rcvbuf, rcvbufForce)
+		if err != nil {
+			return err
+		}
 	}
 	if done != nil {
 		go func() {
@@ -2445,6 +2469,14 @@ func (h *Handle) LinkSetBrProxyArpWiFi(link Link, mode bool) error {
 	return h.setProtinfoAttr(link, mode, nl.IFLA_BRPORT_PROXYARP_WIFI)
 }
 
+func LinkSetBrNeighSuppress(link Link, mode bool) error {
+	return pkgHandle.LinkSetBrNeighSuppress(link, mode)
+}
+
+func (h *Handle) LinkSetBrNeighSuppress(link Link, mode bool) error {
+	return h.setProtinfoAttr(link, mode, nl.IFLA_BRPORT_NEIGH_SUPPRESS)
+}
+
 func (h *Handle) setProtinfoAttr(link Link, mode bool, attr int) error {
 	base := link.Attrs()
 	h.ensureIndex(base)
@@ -2518,6 +2550,80 @@ func (h *Handle) LinkSetGroup(link Link, group int) error {
 
 	_, err := req.Execute(unix.NETLINK_ROUTE, 0)
 	return err
+}
+
+func addNetkitAttrs(nk *Netkit, linkInfo *nl.RtAttr, flag int) error {
+	if nk.peerLinkAttrs.HardwareAddr != nil || nk.HardwareAddr != nil {
+		return fmt.Errorf("netkit doesn't support setting Ethernet")
+	}
+
+	data := linkInfo.AddRtAttr(nl.IFLA_INFO_DATA, nil)
+	// Kernel will return error if trying to change the mode of an existing netkit device
+	data.AddRtAttr(nl.IFLA_NETKIT_MODE, nl.Uint32Attr(uint32(nk.Mode)))
+	data.AddRtAttr(nl.IFLA_NETKIT_POLICY, nl.Uint32Attr(uint32(nk.Policy)))
+	data.AddRtAttr(nl.IFLA_NETKIT_PEER_POLICY, nl.Uint32Attr(uint32(nk.PeerPolicy)))
+
+	if (flag & unix.NLM_F_EXCL) == 0 {
+		// Modifying peer link attributes will not take effect
+		return nil
+	}
+
+	peer := data.AddRtAttr(nl.IFLA_NETKIT_PEER_INFO, nil)
+	msg := nl.NewIfInfomsg(unix.AF_UNSPEC)
+	if nk.peerLinkAttrs.Flags&net.FlagUp != 0 {
+		msg.Change = unix.IFF_UP
+		msg.Flags = unix.IFF_UP
+	}
+	if nk.peerLinkAttrs.Index != 0 {
+		msg.Index = int32(nk.peerLinkAttrs.Index)
+	}
+	peer.AddChild(msg)
+	if nk.peerLinkAttrs.Name != "" {
+		peer.AddRtAttr(unix.IFLA_IFNAME, nl.ZeroTerminated(nk.peerLinkAttrs.Name))
+	}
+	if nk.peerLinkAttrs.MTU > 0 {
+		peer.AddRtAttr(unix.IFLA_MTU, nl.Uint32Attr(uint32(nk.peerLinkAttrs.MTU)))
+	}
+	if nk.peerLinkAttrs.GSOMaxSegs > 0 {
+		peer.AddRtAttr(unix.IFLA_GSO_MAX_SEGS, nl.Uint32Attr(nk.peerLinkAttrs.GSOMaxSegs))
+	}
+	if nk.peerLinkAttrs.GSOMaxSize > 0 {
+		peer.AddRtAttr(unix.IFLA_GSO_MAX_SIZE, nl.Uint32Attr(nk.peerLinkAttrs.GSOMaxSize))
+	}
+	if nk.peerLinkAttrs.GSOIPv4MaxSize > 0 {
+		peer.AddRtAttr(unix.IFLA_GSO_IPV4_MAX_SIZE, nl.Uint32Attr(nk.peerLinkAttrs.GSOIPv4MaxSize))
+	}
+	if nk.peerLinkAttrs.GROIPv4MaxSize > 0 {
+		peer.AddRtAttr(unix.IFLA_GRO_IPV4_MAX_SIZE, nl.Uint32Attr(nk.peerLinkAttrs.GROIPv4MaxSize))
+	}
+	if nk.peerLinkAttrs.Namespace != nil {
+		switch ns := nk.peerLinkAttrs.Namespace.(type) {
+		case NsPid:
+			peer.AddRtAttr(unix.IFLA_NET_NS_PID, nl.Uint32Attr(uint32(ns)))
+		case NsFd:
+			peer.AddRtAttr(unix.IFLA_NET_NS_FD, nl.Uint32Attr(uint32(ns)))
+		}
+	}
+	return nil
+}
+
+func parseNetkitData(link Link, data []syscall.NetlinkRouteAttr) {
+	netkit := link.(*Netkit)
+	for _, datum := range data {
+		switch datum.Attr.Type {
+		case nl.IFLA_NETKIT_PRIMARY:
+			isPrimary := datum.Value[0:1][0]
+			if isPrimary != 0 {
+				netkit.isPrimary = true
+			}
+		case nl.IFLA_NETKIT_MODE:
+			netkit.Mode = NetkitMode(native.Uint32(datum.Value[0:4]))
+		case nl.IFLA_NETKIT_POLICY:
+			netkit.Policy = NetkitPolicy(native.Uint32(datum.Value[0:4]))
+		case nl.IFLA_NETKIT_PEER_POLICY:
+			netkit.PeerPolicy = NetkitPolicy(native.Uint32(datum.Value[0:4]))
+		}
+	}
 }
 
 func parseVlanData(link Link, data []syscall.NetlinkRouteAttr) {
