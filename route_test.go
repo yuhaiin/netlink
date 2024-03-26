@@ -6,6 +6,7 @@ package netlink
 import (
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -330,6 +331,72 @@ func TestRoute6AddDel(t *testing.T) {
 	}
 }
 
+func TestRouteChange(t *testing.T) {
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	// get loopback interface
+	link, err := LinkByName("lo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// bring the interface up
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+
+	// add a gateway route
+	dst := &net.IPNet{
+		IP:   net.IPv4(192, 168, 0, 0),
+		Mask: net.CIDRMask(24, 32),
+	}
+
+	ip := net.IPv4(127, 1, 1, 1)
+	route := Route{LinkIndex: link.Attrs().Index, Dst: dst, Src: ip}
+
+	if err := RouteChange(&route); err == nil {
+		t.Fatal("Route added while it should fail")
+	}
+
+	if err := RouteAdd(&route); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := RouteList(link, FAMILY_V4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatal("Route not added properly")
+	}
+
+	ip = net.IPv4(127, 1, 1, 2)
+	route = Route{LinkIndex: link.Attrs().Index, Dst: dst, Src: ip}
+	if err := RouteChange(&route); err != nil {
+		t.Fatal(err)
+	}
+
+	routes, err = RouteList(link, FAMILY_V4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(routes) != 1 || !routes[0].Src.Equal(ip) {
+		t.Fatal("Route not changed properly")
+	}
+
+	if err := RouteDel(&route); err != nil {
+		t.Fatal(err)
+	}
+	routes, err = RouteList(link, FAMILY_V4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 0 {
+		t.Fatal("Route not removed properly")
+	}
+}
+
 func TestRouteReplace(t *testing.T) {
 	tearDown := setUpNetlinkTest(t)
 	defer tearDown()
@@ -389,7 +456,6 @@ func TestRouteReplace(t *testing.T) {
 	if len(routes) != 0 {
 		t.Fatal("Route not removed properly")
 	}
-
 }
 
 func TestRouteAppend(t *testing.T) {
@@ -477,13 +543,14 @@ func TestRouteAddIncomplete(t *testing.T) {
 	}
 }
 
-// expectNeighUpdate returns whether the expected updated is received within one minute.
-func expectRouteUpdate(ch <-chan RouteUpdate, t uint16, dst net.IP) bool {
+// expectRouteUpdate returns whether the expected updated is received within one minute.
+func expectRouteUpdate(ch <-chan RouteUpdate, t, f uint16, dst net.IP) bool {
 	for {
 		timeout := time.After(time.Minute)
 		select {
 		case update := <-ch:
 			if update.Type == t &&
+				update.NlFlags == f &&
 				update.Route.Dst != nil &&
 				update.Route.Dst.IP.Equal(dst) {
 				return true
@@ -528,13 +595,13 @@ func TestRouteSubscribe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, dst.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, unix.NLM_F_EXCL|unix.NLM_F_CREATE, dst.IP) {
 		t.Fatal("Add update not received as expected")
 	}
 	if err := RouteDel(&route); err != nil {
 		t.Fatal(err)
 	}
-	if !expectRouteUpdate(ch, unix.RTM_DELROUTE, dst.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_DELROUTE, 0, dst.IP) {
 		t.Fatal("Del update not received as expected")
 	}
 }
@@ -583,7 +650,7 @@ func TestRouteSubscribeWithOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, dst.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, unix.NLM_F_EXCL|unix.NLM_F_CREATE, dst.IP) {
 		t.Fatal("Add update not received as expected")
 	}
 }
@@ -635,13 +702,13 @@ func TestRouteSubscribeAt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, dst.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, unix.NLM_F_EXCL|unix.NLM_F_CREATE, dst.IP) {
 		t.Fatal("Add update not received as expected")
 	}
 	if err := nh.RouteDel(&route); err != nil {
 		t.Fatal(err)
 	}
-	if !expectRouteUpdate(ch, unix.RTM_DELROUTE, dst.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_DELROUTE, 0, dst.IP) {
 		t.Fatal("Del update not received as expected")
 	}
 }
@@ -696,7 +763,7 @@ func TestRouteSubscribeListExisting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, dst10.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, 0, dst10.IP) {
 		t.Fatal("Existing add update not received as expected")
 	}
 
@@ -711,19 +778,19 @@ func TestRouteSubscribeListExisting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, dst.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_NEWROUTE, unix.NLM_F_EXCL|unix.NLM_F_CREATE, dst.IP) {
 		t.Fatal("Add update not received as expected")
 	}
 	if err := nh.RouteDel(&route); err != nil {
 		t.Fatal(err)
 	}
-	if !expectRouteUpdate(ch, unix.RTM_DELROUTE, dst.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_DELROUTE, 0, dst.IP) {
 		t.Fatal("Del update not received as expected")
 	}
 	if err := nh.RouteDel(&route10); err != nil {
 		t.Fatal(err)
 	}
-	if !expectRouteUpdate(ch, unix.RTM_DELROUTE, dst10.IP) {
+	if !expectRouteUpdate(ch, unix.RTM_DELROUTE, 0, dst10.IP) {
 		t.Fatal("Del update not received as expected")
 	}
 }
@@ -929,6 +996,146 @@ func TestRouteMultiPath(t *testing.T) {
 	if len(routes[0].MultiPath) != 2 {
 		t.Fatal("MultiPath Route not added properly")
 	}
+}
+
+func TestRouteIifOption(t *testing.T) {
+	skipUnlessRoot(t)
+
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
+	rootNs, err := netns.GetFromPid(1)
+	if err != nil {
+		t.Fatalf("could not get root ns: %s", err)
+	}
+	t.Cleanup(func() { rootNs.Close() })
+
+	rootHdl, err := NewHandleAt(rootNs)
+	if err != nil {
+		t.Fatalf("could not create handle for root ns: %s", err)
+	}
+	t.Cleanup(func() { rootHdl.Close() })
+
+	// setup a veth pair across two namespaces
+	//   veth1 (2.2.2.3/24) <-> veth2 (2.2.2.4/24)
+
+	// peer ns for veth pair
+	ns, err := netns.New()
+	if err != nil {
+		t.Fatalf("could not create new ns: %s", err)
+	}
+	t.Cleanup(func() { ns.Close() })
+
+	l := &Veth{
+		LinkAttrs:     LinkAttrs{Name: "veth1"},
+		PeerName:      "veth2",
+		PeerNamespace: NsFd(ns),
+	}
+	if err = rootHdl.LinkAdd(l); err != nil {
+		t.Fatalf("could not add veth interface: %s", err)
+	}
+	t.Cleanup(func() { rootHdl.LinkDel(l) })
+
+	ve1, err := rootHdl.LinkByName("veth1")
+	if err != nil {
+		t.Fatalf("could not get link veth1: %s", err)
+	}
+
+	err = rootHdl.AddrAdd(ve1, &Addr{IPNet: &net.IPNet{IP: net.ParseIP("2.2.2.3"), Mask: net.CIDRMask(24, 32)}})
+	if err != nil {
+		t.Fatalf("could not set address for veth1: %s", err)
+	}
+
+	nh, err := NewHandleAt(ns)
+	if err != nil {
+		t.Fatalf("could not get handle for ns %+v: %s", ns, err)
+	}
+	t.Cleanup(func() { nh.Close() })
+
+	ve2, err := nh.LinkByName("veth2")
+	if err != nil {
+		t.Fatalf("could not get link veth2: %s", err)
+	}
+
+	err = nh.AddrAdd(ve2, &Addr{IPNet: &net.IPNet{IP: net.ParseIP("2.2.2.4"), Mask: net.CIDRMask(24, 32)}})
+	if err != nil {
+		t.Fatalf("could set address for veth2: %s", err)
+	}
+
+	if err = rootHdl.LinkSetUp(ve1); err != nil {
+		t.Fatalf("could not set veth1 up: %s", err)
+	}
+
+	if err = nh.LinkSetUp(ve2); err != nil {
+		t.Fatalf("could not set veth2 up: %s", err)
+	}
+
+	err = nh.RouteAdd(&Route{
+		Dst: &net.IPNet{
+			IP:   net.IPv4zero,
+			Mask: net.CIDRMask(0, 32),
+		},
+		Gw: net.ParseIP("2.2.2.3"),
+	})
+	if err != nil {
+		t.Fatalf("could not add default route to ns: %s", err)
+	}
+
+	// setup finished, now do the actual test
+
+	_, err = rootHdl.RouteGetWithOptions(net.ParseIP("8.8.8.8"), &RouteGetOptions{
+		SrcAddr: net.ParseIP("2.2.2.4"),
+	})
+	if err == nil {
+		t.Fatal("route get should have resulted in error but did not")
+	}
+
+	testWithOptions := func(opts *RouteGetOptions) {
+		routes, err := rootHdl.RouteGetWithOptions(net.ParseIP("8.8.8.8"), opts)
+		if err != nil {
+			t.Fatalf("could not get route: %s", err)
+		}
+		if len(routes) != 1 {
+			t.Fatalf("did not get exactly one route, routes: %+v", routes)
+		}
+
+		// should be the default route
+		r, err := rootHdl.RouteGet(net.ParseIP("8.8.8.8"))
+		if err != nil {
+			t.Fatalf("could not get default route for 8.8.8.8: %s", err)
+		}
+		if len(r) != 1 {
+			t.Fatalf("did not get exactly one route, routes: %+v", routes)
+		}
+		if !routes[0].Gw.Equal(r[0].Gw) {
+			t.Fatalf("wrong gateway in route: expected: %s, got: %s", r[0].Gw, routes[0].Gw)
+		}
+		if routes[0].LinkIndex != r[0].LinkIndex {
+			t.Fatalf("wrong link in route: expected: %d, got: %d", r[0].LinkIndex, routes[0].LinkIndex)
+		}
+	}
+
+	t.Run("with iif", func(t *testing.T) {
+		testWithOptions(&RouteGetOptions{
+			SrcAddr: net.ParseIP("2.2.2.4"),
+			Iif:     "veth1",
+		})
+	})
+
+	t.Run("with iifIndex", func(t *testing.T) {
+		testWithOptions(&RouteGetOptions{
+			SrcAddr:  net.ParseIP("2.2.2.4"),
+			IifIndex: ve1.Attrs().Index,
+		})
+	})
+
+	t.Run("with iif and iifIndex", func(t *testing.T) {
+		testWithOptions(&RouteGetOptions{
+			SrcAddr:  net.ParseIP("2.2.2.4"),
+			Iif:      "veth1",
+			IifIndex: ve2.Attrs().Index, // Iif will supersede here
+		})
+	})
 }
 
 func TestRouteOifOption(t *testing.T) {

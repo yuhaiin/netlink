@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -385,6 +387,10 @@ func compareGeneve(t *testing.T, expected, actual *Geneve) {
 
 	if actual.FlowBased != expected.FlowBased {
 		t.Fatal("Geneve.FlowBased doesn't match")
+	}
+
+	if actual.InnerProtoInherit != expected.InnerProtoInherit {
+		t.Fatal("Geneve.InnerProtoInherit doesn't match")
 	}
 
 	// TODO: we should implement the rest of the geneve methods
@@ -1605,10 +1611,8 @@ func TestLinkAddDelVxlanFlowBased(t *testing.T) {
 }
 
 func TestLinkAddDelBareUDP(t *testing.T) {
-	if os.Getenv("CI") == "true" {
-		t.Skipf("Fails in CI due to operation not supported (missing kernel module?)")
-	}
-	minKernelRequired(t, 5, 8)
+	minKernelRequired(t, 5, 1)
+	setUpNetlinkTestWithKModule(t, "bareudp")
 	tearDown := setUpNetlinkTest(t)
 	defer tearDown()
 
@@ -1635,6 +1639,7 @@ func TestBareUDPCompareToIP(t *testing.T) {
 	}
 	// requires iproute2 >= 5.10
 	minKernelRequired(t, 5, 9)
+	setUpNetlinkTestWithKModule(t, "bareudp")
 	ns, tearDown := setUpNamedNetlinkTest(t)
 	defer tearDown()
 
@@ -1883,6 +1888,72 @@ func TestLinkSet(t *testing.T) {
 	if link.Attrs().Group != 42 {
 		t.Fatal("Link group not changed")
 	}
+}
+
+func TestLinkAltName(t *testing.T) {
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	iface := &Dummy{LinkAttrs{Name: "bar"}}
+	if err := LinkAdd(iface); err != nil {
+		t.Fatal(err)
+	}
+
+	link, err := LinkByName("bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	altNames := []string{"altname", "altname2", "some_longer_altname"}
+	sort.Strings(altNames)
+	altNamesStr := strings.Join(altNames, ",")
+
+	for _, altname := range altNames {
+		err = LinkAddAltName(link, altname)
+		if err != nil {
+			t.Fatalf("Could not add %s: %v", altname, err)
+		}
+	}
+
+	link, err = LinkByName("bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sort.Strings(link.Attrs().AltNames)
+	linkAltNamesStr := strings.Join(link.Attrs().AltNames, ",")
+
+	if altNamesStr != linkAltNamesStr {
+		t.Fatalf("Expected %s AltNames, got %s", altNamesStr, linkAltNamesStr)
+	}
+
+	for _, altname := range altNames {
+		link, err = LinkByName(altname)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for idx, altName := range altNames {
+		err = LinkDelAltName(link, altName)
+		if err != nil {
+			t.Fatalf("Could not delete %s: %v", altName, err)
+		}
+
+		link, err = LinkByName("bar")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sort.Strings(link.Attrs().AltNames)
+		linkAltNamesStr := strings.Join(link.Attrs().AltNames, ",")
+		altNamesStr := strings.Join(altNames[idx+1:], ",")
+
+		if linkAltNamesStr != altNamesStr {
+			t.Fatalf("Expected %s AltNames, got %s", altNamesStr, linkAltNamesStr)
+		}
+	}
+
 }
 
 func TestLinkSetARP(t *testing.T) {
